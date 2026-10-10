@@ -1,206 +1,107 @@
 # Coding Agent Hooks by Sondera
 
 > Released as part of the *Hooking Coding Agents with the Cedar Policy Language*
-> talk at [Unprompted 2026](https://unpromptedcon.org/).
+> talk at [Unprompted 2026](https://unpromptedcon.org/), and updated for
+> presentation at
+> [Black Hat Arsenal 2026](https://blackhat.com/us-26/arsenal/schedule/index.html)
+> and the
+> [Vegas AI Security Forum '26](https://aisecurity.forum/events/vegas-ai-security-forum-26/).
+> See also our ICML 2026 *Agents in the Wild* workshop paper:
+> [arXiv:2606.26649](https://arxiv.org/abs/2606.26649).
 
-A reference monitor for AI coding agents. Rust hook binaries and [Cedar](https://docs.cedarpolicy.com/) policies
-intercept every shell command, file operation, and web request to forbid
-exfiltration and destructive behaviors, and enforce information flow control.
-YARA signatures and Cedar policy evaluation are deterministic; the optional
-LLM-based classifiers (data sensitivity, secure code policy) are probabilistic.
+A reference monitor for AI coding agents. Rust hook binaries and
+[Cedar](https://docs.cedarpolicy.com/) policies intercept every shell command,
+file operation, and web request to forbid exfiltration and destructive
+behaviors, and enforce information flow control. YARA signatures and Cedar
+policy evaluation are deterministic. The optional LLM-based classifiers (data
+sensitivity, secure code policy) are probabilistic and configurable in
+`.sondera/sondera.toml` — see [Configuration](docs/configuration.md).
 
 Works with [Claude Code](https://code.claude.com/docs/en/hooks),
 [Cursor](https://cursor.com/docs/agent/hooks),
 [GitHub Copilot](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/coding-agent/use-hooks),
-and [Gemini CLI](https://geminicli.com/docs/hooks/).
-
-## Getting Started
-
-### Prerequisites
-
-The YARA signature engine and Cedar policies work without any external
-dependencies. The LLM-based classifiers (data sensitivity and secure code
-policy) require [Ollama](https://ollama.com/) with the `gpt-oss-safeguard-20b`
-model:
-
-```bash
-# Install Ollama — see https://ollama.com/download for other platforms
-brew install ollama
-
-# Pull the model (~12 GB)
-ollama pull gpt-oss-safeguard-20b
-```
-
-### 1. Start the harness server
-
-The harness server loads Cedar policies and listens on a Unix socket for
-hook connections.
-
-```bash
-cargo run --bin sondera-harness-server -- -v
-```
-
-By default, it loads policies from `./policies` and the socket path is
-resolved in order of preference:
-
-| Priority | Path                                    | When                               |
-|----------|-----------------------------------------|------------------------------------|
-| 1        | `/var/run/sondera/sondera-harness.sock` | Directory exists or can be created |
-| 2        | `~/.sondera/sondera-harness.sock`       | Fallback for unprivileged users    |
-
-Override with `--socket`:
-
-```bash
-cargo run --bin sondera-harness-server -- \
-  --policy-path /path/to/policies \
-  --socket /var/run/sondera/sondera-harness.sock \
-  -v
-```
-
-See [Deployment](#deployment) for more details on socket ownership and permissions.
-
-### 2. Install hooks for Claude Code
-
-The `sondera-claude` binary registers hooks for all Claude Code lifecycle
-events (pre-tool-use, post-tool-use, session-start, etc.). Choose a scope:
-
-```bash
-# Local (default) — .claude/settings.local.json, not committed to git
-cargo run -p sondera-claude -- install
-
-# Project — .claude/settings.json, committed to git, shared with team
-cargo run -p sondera-claude -- install --project
-
-# User — ~/.claude/settings.json, applies to all projects
-cargo run -p sondera-claude -- install --user
-```
-
-To uninstall, use the same scope flag:
-
-```bash
-cargo run -p sondera-claude -- uninstall --user
-```
-
-Hooks for Cursor (`sondera-cursor`), GitHub Copilot (`sondera-copilot`), and
-Gemini CLI (`sondera-gemini`) follow the same pattern.
-
-### 3. Policies
-
-Cedar policies and the schema live in `policies/`. The harness server loads all
-`.cedar` and `.cedarschema` files from this directory at startup.
-
-```
-policies/
-├── base.cedarschema       # Entity types (Agent, Trajectory, Tool, File, Label, Taint) and actions
-├── base.cedar             # Default-permit baseline with targeted forbids for prompt injection,
-│                          #   credential access, data exfiltration, shell/web/file pre- and
-│                          #   post-execution gates, and trajectory-level runaway protection
-├── destructive.cedar      # Blocks irreversible operations: rm -rf, git force-push, terraform
-│                          #   destroy, DROP DATABASE, lock file deletion, kill -9, and more
-├── file.cedar             # File-type-aware guards: Bell-LaPadula IFC (no write-down), private
-│                          #   key access, secrets in source code, obfuscation in scripts, and
-│                          #   OWASP/CWE policy violations (injection, weak crypto, broken authz)
-├── ifc.cedar              # Information flow control: sensitivity-gated outbound blocking,
-│                          #   taint propagation guards, network tool restrictions, and
-│                          #   step-count limits scaled by data classification level
-├── supply_chain_risk.cedar # Supply chain attack detection: typosquatting, dependency confusion,
-│                          #   build script injection, lock file tampering, and registry exfiltration
-├── ifc.toml               # Prompt templates for LLM-based data classification
-└── policies.toml          # Prompt templates for LLM-based secure code generation evaluation
-```
-
-Write your own `.cedar` files into this directory to add custom rules. The
-harness evaluates all policies on every hook event — a single matching `forbid`
-overrides any `permit`.
-
-## Architecture
+and [Gemini CLI](https://geminicli.com/docs/hooks/), plus adapters for
+Antigravity, Codex, Hermes, OpenCode, OpenHands, and VS Code —
+`sondera hook --help` lists the full set.
 
 ![Architecture](docs/architecture.png)
 
-Agent frameworks (Claude Code, Cursor, Copilot, Gemini CLI) communicate with
-per-agent **hook adapter** binaries over stdin/stdout JSON. Each hook binary
-forwards events over **tarpc RPC** (Unix socket) to the harness service layer,
-which coordinates three guardrail subsystems:
+A hook adapter normalizes its agent's event and forwards it over gRPC to
+`sondera serve`, which combines deterministic signature scanning with Cedar
+policy evaluation and returns Allow, Deny, or Escalate. If the harness cannot be
+reached, enforcement hooks fail closed.
 
-1. **Signature Engine** (YARA-X) — pattern-matches tool inputs/outputs for prompt injection, data exfiltration, secrets,
-   and obfuscation.
-2. **Policy Model** (gpt-oss-safeguard-20b via Ollama) — classifies content against secure code generation categories.
-3. **Information Flow Control** (gpt-oss-safeguard-20b via Ollama) — assigns sensitivity labels for data classification.
+## Enforcement at a glance
 
-The **Cedar Policy Engine** loads policies and schema fragments authored by a
-policy agent via the MCP server, combines guardrail signals with entity state
-from the **Fjall key-value store**, and returns an adjudication
-(Allow / Deny / Escalate) back through the hook binary to the agent.
+What each adapter can do with a decision, by hook group — **block** (deny,
+fail-closed), **ask** (escalate to the host's approval UI), **steer** (inject
+context), **redact** (replace tool output), **terminate** (stop the loop),
+*observe* (recorded only):
 
-### Event Model
+| Adapter | PreModel | PostModel | PreTool | PostTool |
+|---|---|---|---|---|
+| Claude Code | block · steer | *observe* | block · ask | block · redact |
+| VS Code | block · steer · terminate | *observe* | block · ask | block · steer |
+| Gemini CLI | block · steer | block | block | steer |
+| Antigravity | *observe* | *observe* | block · ask | *observe* |
+| Copilot | block | *observe* | block | *observe* |
+| Cursor | block | *observe* | block · ask | *observe* |
+| Codex | block | *observe* | block · ask | block |
+| Hermes | steer | *observe* | block | *observe* |
+| OpenCode | — | — | block · ask | *observe* |
+| OpenHands | block · steer | block | block · steer | *observe* |
 
-![Event model](docs/event.png)
+Terms, the per-event matrix behind each cell, and the caveats it compresses are
+defined in
+[crates/hooks/README.md](https://github.com/sondera-ai/sondera-coding-agent-hooks/blob/main/crates/hooks/README.md).
 
-The harness models agent execution as a trajectory of typed events. Each hook
-adapter normalizes its agent-specific JSON into four event categories:
+## Quick start
 
-| Category        | Description                                              | Examples                                                                    |
-|-----------------|----------------------------------------------------------|-----------------------------------------------------------------------------|
-| **Action**      | Agent-initiated operations, evaluated *before* execution | `ShellCommand`, `FileRead`, `FileWrite`, `FileEdit`, `WebFetch`, `ToolCall` |
-| **Observation** | Environment responses, evaluated *after* execution       | `ShellCommandOutput`, `FileOperationResult`, `WebFetchOutput`, `Prompt`     |
-| **Control**     | Lifecycle events that manage the trajectory              | `Started`, `Completed`, `Failed`, `Adjudicated`                             |
-| **State**       | Snapshots of environment context                         | Working directory, open files, git branch                                   |
-
-Each adapter maps agent-specific tool names to these common types — Claude's
-`Bash` tool, Cursor's shell execution hook, Copilot's `bash` tool, and Gemini's
-`bash` tool all normalize to the same `ShellCommand` action. The harness
-evaluates policies against these normalized events, so Cedar rules work
-identically across all four agents.
-
-### References
-
-- [Cedar Policy Language](https://docs.cedarpolicy.com/)
-- [Claude Code Hooks](https://code.claude.com/docs/en/hooks)
-- [Cursor Agent Hooks](https://cursor.com/docs/agent/hooks)
-- [GitHub Copilot Hooks](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/coding-agent/use-hooks)
-- [Gemini CLI Hooks](https://geminicli.com/docs/hooks/)
-
-## Workspace
-
-| Crate                         | Purpose                                                              |
-|-------------------------------|----------------------------------------------------------------------|
-| `crates/harness`              | Cedar policy engine, entity store, trajectory storage, tarpc RPC     |
-| `crates/guardrails/signature` | YARA-X signature scanning (prompt injection, exfiltration, secrets)  |
-| `crates/guardrails/ifc`       | LLM-based data classification (Microsoft Purview sensitivity labels) |
-| `crates/guardrails/policy`    | LLM-based policy evaluation (secure code generation categories)      |
-| `crates/common`               | Shared I/O utilities for hook binaries (stdin/stdout JSON, tracing)  |
-| `crates/mcp`                  | MCP server for interactive Cedar policy authoring                    |
-| `apps/claude`                 | Claude Code hooks                                                    |
-| `apps/cursor`                 | Cursor hooks                                                         |
-| `apps/copilot`                | GitHub Copilot hooks                                                 |
-| `apps/gemini`                 | Gemini CLI hooks                                                     |
-
-## Development
+Download the archive for Linux x86-64 or Apple silicon from
+[Releases](https://github.com/sondera-ai/sondera-coding-agent-hooks/releases),
+or build from source with [Rust](https://www.rust-lang.org/) and Cargo. Then:
 
 ```bash
-# Test
-cargo test --workspace
+# 1. Start the harness (gRPC on 127.0.0.1:50051)
+cargo run -p sondera -- serve -v
 
-# Lint
+# 2. Wire hooks into your agent — here, Claude Code
+cargo run -p sondera -- hook claude install
+
+# 3. Watch adjudicated runs
+cargo run -p sondera -- tui
+```
+
+Installed from an archive, those commands are `./sondera serve`, and so on. No
+provider or API key is needed: the signature engine and Cedar policies run with
+no external dependencies.
+
+[Getting Started](docs/getting-started.md) covers each step in full.
+
+## Documentation
+
+| Page | What it covers |
+|------|----------------|
+| [Getting Started](docs/getting-started.md) | Install, start the harness, wire up your agent |
+| [Configuration](docs/configuration.md) | `.sondera/` resolution, `sondera.toml`, and the optional LLM guardrails |
+| [Policies](docs/policies.md) | The 110-policy Cedar corpus, custom rules, and the `sondera mcp` authoring server |
+| [Terminal UI](docs/tui.md) | Browsing trajectories with `sondera tui` |
+| [Architecture](docs/architecture.md) | How a hook event becomes an adjudication, and the normalized event model |
+| [Deployment](docs/deployment.md) | Production hardening and the trust boundary around each surface |
+| [Development](docs/development.md) | The workspace crates and the checks CI runs |
+
+## Contributing
+
+```bash
 cargo fmt --all -- --check
-cargo clippy --all-features -- -D warnings
+cargo clippy --locked --all-features -- -D warnings
+cargo test --locked --workspace
 ```
 
-## Deployment
-
-**Production hardening.** The `sondera-harness-server` socket path is security-critical, whichever process
-binds it first controls adjudication for all hook clients. Pre-create the directory with restricted ownership to prevent
-a rogue process from binding the path before the harness starts:
-
-```bash
-sudo mkdir -p /var/run/sondera
-sudo chown sondera:sondera /var/run/sondera
-sudo chmod 0750 /var/run/sondera
-```
-
-On systemd hosts, use `RuntimeDirectory=sondera` in the unit file instead, which creates and locks down `/run/sondera/`
-automatically. Avoid the home directory fallback in production, its world-writable parent makes it vulnerable to
-pre-binding races.
+[Development](docs/development.md) lists the rest of what CI runs;
+[AGENTS.md](https://github.com/sondera-ai/sondera-coding-agent-hooks/blob/main/AGENTS.md)
+holds the working conventions — the local gate, error
+handling, and which surface owns which fact.
 
 ## License
 
